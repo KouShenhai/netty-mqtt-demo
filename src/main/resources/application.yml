@@ -1,0 +1,41 @@
+mqtt:
+  client:
+    host: 127.0.0.1
+    port: 1883
+    client-id: ""            # 留空自动生成
+    username:
+    password:
+    clean-session: true
+    keep-alive-seconds: 60
+    connect-timeout-ms: 10000
+    max-message-size-bytes: 8388608
+    auto-connect: true
+    io-threads: 1
+    # ---- QoS1/2 可靠性 ----
+    max-inflight: 10000      # 最大在途消息，背压保护
+    ack-timeout-ms: 10000    # ACK 超时重传
+    ack-max-retries: 3       # -1 表示无限重试（消息不丢）
+    queue-when-disconnected: true   # 断线时 QoS1/2 入队，重连后补发
+    # ---- 自动重连 ----
+    reconnect:
+      enabled: true
+      initial-delay-ms: 1000
+      max-delay-ms: 60000
+      multiplier: 2.0
+      jitter: 0.2
+      max-attempts: -1       # -1 无限重连
+    # ---- TLS ----
+    ssl:
+      enabled: false
+      insecure-skip-verify: false
+    # ---- 演示 ----
+    demo:
+      enabled: false
+
+spring:
+  application:
+    name: netty-mqtt-client
+
+logging:
+  level:
+    com.example.mqtt: info
