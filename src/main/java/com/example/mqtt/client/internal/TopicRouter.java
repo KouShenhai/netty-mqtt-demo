@@ -57,7 +57,7 @@ public class TopicRouter {
         try {
             Node node = root;
             for (String level : matchLevels(topicFilter)) {
-                node = node.children.computeIfAbsent(level, k -> new Node());
+                node = node.children.computeIfAbsent(level, _ -> new Node());
             }
             Subscription sub = new Subscription(topicFilter, qos, listener);
             if (!node.subscriptions.contains(sub)) {
@@ -67,31 +67,6 @@ public class TopicRouter {
         } finally {
             lock.writeLock().unlock();
         }
-    }
-
-    public void unsubscribe(String topicFilter, MqttMessageListener listener) {
-        lock.writeLock().lock();
-        try {
-            remove(root, matchLevels(topicFilter), 0, listener);
-            // 该过滤器下已无监听器时才从恢复表中移除
-            if (collect(topicFilter).isEmpty()) {
-                subscriptions.remove(topicFilter);
-            }
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    private boolean remove(Node node, String[] levels, int idx, MqttMessageListener listener) {
-        if (idx == levels.length) {
-            node.subscriptions.removeIf(s -> listener == null || s.listener() == listener);
-            return node.subscriptions.isEmpty();
-        }
-        Node child = node.children.get(levels[idx]);
-        if (child != null && remove(child, levels, idx + 1, listener) && child.children.isEmpty()) {
-            node.children.remove(levels[idx]);
-        }
-        return node.subscriptions.isEmpty();
     }
 
     /** 查找匹配某主题的所有监听器 */
@@ -131,26 +106,6 @@ public class TopicRouter {
         lock.readLock().lock();
         try {
             return Map.copyOf(subscriptions);
-        } finally {
-            lock.readLock().unlock();
-        }
-    }
-
-    private List<Subscription> collect(String topicFilter) {
-        Node node = root;
-        for (String level : matchLevels(topicFilter)) {
-            node = node.children.get(level);
-            if (node == null) {
-                return List.of();
-            }
-        }
-        return node.subscriptions;
-    }
-
-    public int subscriptionCount() {
-        lock.readLock().lock();
-        try {
-            return subscriptions.size();
         } finally {
             lock.readLock().unlock();
         }

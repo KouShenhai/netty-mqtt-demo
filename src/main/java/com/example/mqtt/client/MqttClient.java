@@ -26,30 +26,4 @@ public interface MqttClient {
     /** 发布消息 */
     CompletableFuture<Void> publish(String topic, byte[] payload, MqttQoS qos, boolean retained);
 
-    default CompletableFuture<Void> publish(String topic, byte[] payload, MqttQoS qos) {
-        return publish(topic, payload, qos, false);
-    }
-
-    default CompletableFuture<Void> publish(String topic, String payload, MqttQoS qos) {
-        return publish(topic, payload.getBytes(StandardCharsets.UTF_8), qos, false);
-    }
-
-    /**
-     * 订阅主题（支持 + 与 # 通配符）。
-     *
-     * @return future 完成值为 Broker 授予的 QoS 等级
-     */
-    CompletableFuture<Integer> subscribe(String topicFilter, MqttQoS qos, MqttMessageListener listener);
-
-    /** 取消订阅 */
-    CompletableFuture<Void> unsubscribe(String topicFilter);
-
-    ClientState state();
-
-    default boolean isConnected() {
-        return state() == ClientState.CONNECTED;
-    }
-
-    /** 当前在途（未确认）QoS1/2 消息数 */
-    int inflightCount();
 }

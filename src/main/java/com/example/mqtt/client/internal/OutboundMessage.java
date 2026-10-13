@@ -4,6 +4,7 @@ import io.netty.handler.codec.mqtt.MqttQoS;
 import io.netty.util.Timeout;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 一条在途（in-flight）出站 QoS1/QoS2 消息及其协议状态。
@@ -28,7 +29,7 @@ public final class OutboundMessage {
 
     public volatile State state;
     public volatile boolean dup;
-    public volatile int retries;
+    public volatile AtomicInteger retries;
     /** ACK 超时定时任务句柄 */
     public volatile Timeout timeoutTask;
     /** 断线期间入队、尚未首次写入 */

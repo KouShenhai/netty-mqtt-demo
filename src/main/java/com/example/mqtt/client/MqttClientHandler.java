@@ -1,6 +1,5 @@
-package com.example.mqtt.client.internal;
+package com.example.mqtt.client;
 
-import com.example.mqtt.client.NettyMqttClient;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -28,9 +27,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>所有业务回调都委托给 {@link NettyMqttClient}，本类只做协议解析与应答。
  * 运行在一个连接的 EventLoop 上，方法天然串行，无需加锁。
  */
-public class MqttProtocolHandler extends SimpleChannelInboundHandler<MqttMessage> {
+public class MqttClientHandler extends SimpleChannelInboundHandler<MqttMessage> {
 
-    private static final Logger log = LoggerFactory.getLogger(MqttProtocolHandler.class);
+    private static final Logger log = LoggerFactory.getLogger(MqttClientHandler.class);
 
     private final NettyMqttClient client;
 
@@ -40,7 +39,7 @@ public class MqttProtocolHandler extends SimpleChannelInboundHandler<MqttMessage
      */
     private final Set<Integer> inboundQos2Pending = ConcurrentHashMap.newKeySet();
 
-    public MqttProtocolHandler(NettyMqttClient client) {
+    public MqttClientHandler(NettyMqttClient client) {
         this.client = client;
     }
 
