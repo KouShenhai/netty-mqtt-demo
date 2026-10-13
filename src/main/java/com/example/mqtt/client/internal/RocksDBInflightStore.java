@@ -4,7 +4,7 @@ import java.util.Collection;
 import java.util.concurrent.ConcurrentHashMap;
 
 /** 基于 {@link ConcurrentHashMap} 的高并发内存在途消息存储。 */
-public class InMemoryInflightStore implements InflightStore {
+public class RocksDBInflightStore implements InflightStore {
 
     private final ConcurrentHashMap<Integer, OutboundMessage> map = new ConcurrentHashMap<>();
 
@@ -33,8 +33,4 @@ public class InMemoryInflightStore implements InflightStore {
         return map.size();
     }
 
-    @Override
-    public void clear() {
-        map.clear();
-    }
 }

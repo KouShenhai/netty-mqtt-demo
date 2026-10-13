@@ -1,6 +1,6 @@
 package com.example.mqtt.client;
 
-import com.example.mqtt.client.internal.InMemoryInflightStore;
+import com.example.mqtt.client.internal.RocksDBInflightStore;
 import com.example.mqtt.client.internal.InflightStore;
 import com.example.mqtt.client.internal.MqttProtocolHandler;
 import com.example.mqtt.client.internal.OutboundMessage;
@@ -13,11 +13,16 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.IoHandlerFactory;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.ServerChannel;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.mqtt.MqttConnAckMessage;
+import io.netty.channel.uring.IoUring;
+import io.netty.channel.uring.IoUringIoHandler;
+import io.netty.channel.uring.IoUringServerSocketChannel;
 import io.netty.handler.codec.mqtt.MqttConnectMessage;
 import io.netty.handler.codec.mqtt.MqttConnectPayload;
 import io.netty.handler.codec.mqtt.MqttConnectVariableHeader;
@@ -48,13 +53,12 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
@@ -82,44 +86,28 @@ public class NettyMqttClient implements MqttClient {
     private final MqttClientProperties props;
     private final InflightStore inflightStore;
     private final TopicRouter router = new TopicRouter();
-    private final PacketIdGenerator packetIdGenerator = new PacketIdGenerator();
-    private final List<MqttEventListener> eventListeners = new CopyOnWriteArrayList<>();
 
     /** SUBACK / UNSUBACK 等待表 */
     private final Map<Integer, CompletableFuture<Integer>> pendingSubAcks = new ConcurrentHashMap<>();
     private final Map<Integer, CompletableFuture<Void>> pendingUnsubAcks = new ConcurrentHashMap<>();
 
-    private final EventLoopGroup ioGroup;
     private final HashedWheelTimer timer;
     private final Executor dispatcher;
-
+    private final String clientId;
     private final AtomicReference<ClientState> state = new AtomicReference<>(ClientState.DISCONNECTED);
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
 
     private volatile Channel channel;
     private volatile CompletableFuture<Void> connectFuture;
     private volatile Timeout reconnectTask;
-    private volatile String clientId;
+    private volatile EventLoopGroup worker;
 
-    public NettyMqttClient(MqttClientProperties props) {
-        this(props, new InMemoryInflightStore());
-    }
-
-    public NettyMqttClient(MqttClientProperties props, InflightStore inflightStore) {
+    public NettyMqttClient(String tenantCode, MqttClientProperties props, InflightStore inflightStore) {
         this.props = props;
         this.inflightStore = inflightStore;
-        this.ioGroup = new MultiThreadIoEventLoopGroup(
-                Math.max(1, props.getIoThreads()), new DefaultThreadFactory("mqtt-io"), NioIoHandler.newFactory());
-        this.timer = new HashedWheelTimer(new DefaultThreadFactory("mqtt-timer"), 100, TimeUnit.MILLISECONDS);
-        // 虚拟线程分发：每条消息一个虚拟线程，业务回调可自由阻塞，不影响 IO
+        this.timer = new HashedWheelTimer(new DefaultThreadFactory("mqtt-client-timer"), 100, TimeUnit.MILLISECONDS);
         this.dispatcher = Executors.newVirtualThreadPerTaskExecutor();
-        this.clientId = props.getClientId() == null || props.getClientId().isBlank()
-                ? "netty-mqtt-" + UUID.randomUUID().toString().substring(0, 16)
-                : props.getClientId();
-    }
-
-    public void addEventListener(MqttEventListener listener) {
-        eventListeners.add(listener);
+        this.clientId = String.format("%s-%s", tenantCode, generateUUID().substring(0, 16));;
     }
 
     // ------------------------------------------------------------------ 连接管理
@@ -154,8 +142,10 @@ public class NettyMqttClient implements MqttClient {
 
     private void doConnect() {
         cancelReconnectTask();
+        worker = new MultiThreadIoEventLoopGroup(props.getWorkerCorePoolSize(), dispatcher,
+                getIoHandlerFactory());
         Bootstrap bootstrap = new Bootstrap()
-                .group(ioGroup)
+                .group(worker)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, props.getConnectTimeoutMs())
                 .option(ChannelOption.TCP_NODELAY, true)
@@ -163,14 +153,10 @@ public class NettyMqttClient implements MqttClient {
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(SocketChannel ch) throws Exception {
-                        if (props.getSsl().isEnabled()) {
-                            ch.pipeline().addLast("ssl", buildSslContext().newHandler(ch.alloc(),
-                                    props.getHost(), props.getPort()));
-                        }
-                        int keepAlive = props.getKeepAliveSeconds();
+                        int keepAlive = props.getKeepAliveTimeSeconds();
                         ch.pipeline()
                                 .addLast("mqtt-encoder", MqttEncoder.INSTANCE)
-                                .addLast("mqtt-decoder", new MqttDecoder(props.getMaxMessageSizeBytes()))
+                                .addLast("mqtt-decoder", new MqttDecoder(props.getMaxBytesInMessage()))
                                 // 写空闲 0.75 倍心跳发 PINGREQ；读空闲 1.5 倍判定失联
                                 .addLast("idle", new IdleStateHandler(
                                         (long) (keepAlive * 1.5), (long) (keepAlive * 0.75), 0, TimeUnit.SECONDS))
@@ -196,38 +182,20 @@ public class NettyMqttClient implements MqttClient {
     }
 
     private MqttConnectMessage buildConnectMessage() {
-        boolean hasUser = props.getUsername() != null;
-        boolean hasPassword = props.getPassword() != null;
-        MqttFixedHeader fixedHeader = new MqttFixedHeader(
-                MqttMessageType.CONNECT, false, MqttQoS.AT_MOST_ONCE, false, 0);
-        MqttConnectVariableHeader variableHeader = new MqttConnectVariableHeader(
-                MqttVersion.MQTT_3_1_1.protocolName(),
-                MqttVersion.MQTT_3_1_1.protocolLevel(),
-                hasUser, hasPassword,
-                false, 0, false,
-                props.isCleanSession(),
-                props.getKeepAliveSeconds(),
-                MqttProperties.NO_PROPERTIES);
-        MqttConnectPayload payload = new MqttConnectPayload(
-                clientId, null, (byte[]) null,
-                props.getUsername(),
-                hasPassword ? props.getPassword().getBytes(java.nio.charset.StandardCharsets.UTF_8) : null);
+        MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.CONNECT, false, MqttQoS.AT_MOST_ONCE, false,
+                0);
+        MqttConnectVariableHeader variableHeader = new MqttConnectVariableHeader(MqttVersion.MQTT_5.protocolName(),
+                MqttVersion.MQTT_5.protocolLevel(), true, true, false, 0, false, props.isCleanSession(),
+                props.getKeepAliveTimeSeconds(), MqttProperties.NO_PROPERTIES);
+        MqttConnectPayload payload = new MqttConnectPayload(clientId, null, null, props.getUsername(),
+                props.getPassword().getBytes(StandardCharsets.UTF_8));
         return new MqttConnectMessage(fixedHeader, variableHeader, payload);
-    }
-
-    private SslContext buildSslContext() throws Exception {
-        SslContextBuilder builder = SslContextBuilder.forClient();
-        if (props.getSsl().isInsecureSkipVerify()) {
-            builder.trustManager(InsecureTrustManagerFactory.INSTANCE);
-        }
-        return builder.build();
     }
 
     /** CONNACK 回调（EventLoop 线程） */
     public void onConnAck(Channel ch, boolean sessionPresent, int returnCode) {
         if (returnCode != 0) {
             log.error("连接被 Broker 拒绝, returnCode={}", returnCode);
-            eventListeners.forEach(l -> safe(() -> l.onConnectionRejected(returnCode)));
             ch.close();
             onConnectFailure(new MqttClientException("CONNACK rejected, returnCode=" + returnCode));
             return;
@@ -240,8 +208,6 @@ public class NettyMqttClient implements MqttClient {
         if (f != null) {
             f.complete(null);
         }
-        eventListeners.forEach(l -> safe(() -> l.onConnected(sessionPresent)));
-
         // 1. 恢复订阅（cleanSession=true 或 Broker 无会话时必需；重复 SUBSCRIBE 对 Broker 幂等）
         restoreSubscriptions();
         // 2. 重发在途 QoS1/2 消息（DUP=1）
@@ -271,14 +237,6 @@ public class NettyMqttClient implements MqttClient {
         if (state.get() == ClientState.CLOSED) {
             return;
         }
-        if (!props.getReconnect().isEnabled()) {
-            state.set(ClientState.DISCONNECTED);
-            CompletableFuture<Void> f = connectFuture;
-            if (f != null && !f.isDone()) {
-                f.completeExceptionally(cause);
-            }
-            return;
-        }
         // 只有首个把状态推进到 RECONNECTING 的调用负责排期，
         // 避免「CONNACK 拒绝 + channelInactive」等并发路径重复调度重连
         ClientState prev = state.getAndSet(ClientState.RECONNECTING);
@@ -290,33 +248,17 @@ public class NettyMqttClient implements MqttClient {
             state.set(ClientState.DISCONNECTED);
             return;
         }
-        eventListeners.forEach(l -> safe(() -> l.onConnectionLost(cause)));
         scheduleReconnect();
     }
 
     private void scheduleReconnect() {
-        int maxAttempts = props.getReconnect().getMaxAttempts();
         int attempt = reconnectAttempts.incrementAndGet();
-        if (maxAttempts >= 0 && attempt > maxAttempts) {
-            log.error("已达最大重连次数 {}，放弃重连", maxAttempts);
-            state.set(ClientState.DISCONNECTED);
-            CompletableFuture<Void> f = connectFuture;
-            if (f != null && !f.isDone()) {
-                f.completeExceptionally(new MqttClientException("重连次数耗尽"));
-            }
-            return;
-        }
         // 指数退避 + 抖动：delay = initial * multiplier^(n-1)，封顶 maxDelay，再叠加 ±jitter 随机
-        double base = props.getReconnect().getInitialDelayMs()
-                * Math.pow(props.getReconnect().getMultiplier(), attempt - 1);
-        double capped = Math.min(base, props.getReconnect().getMaxDelayMs());
-        double jitter = 1.0 + (ThreadLocalRandom.current().nextDouble() * 2 - 1)
-                * props.getReconnect().getJitter();
+        double base = 1000 * Math.pow(2, attempt - 1);
+        double capped = Math.min(base, 60000);
+        double jitter = 1.0 + (ThreadLocalRandom.current().nextDouble() * 2 - 1) * 0.2;
         long delayMs = Math.max(100, (long) (capped * jitter));
-
         log.info("第 {} 次重连将在 {} ms 后进行", attempt, delayMs);
-        eventListeners.forEach(l -> safe(() -> l.onReconnectScheduled(attempt, Duration.ofMillis(delayMs))));
-
         reconnectTask = timer.newTimeout(t -> {
             if (state.get() == ClientState.RECONNECTING && state.compareAndSet(ClientState.RECONNECTING, ClientState.CONNECTING)) {
                 doConnect();
@@ -369,30 +311,25 @@ public class NettyMqttClient implements MqttClient {
                     new MqttClientException("在途消息已达上限 " + props.getMaxInflight() + "，发布被背压拒绝"));
         }
         boolean connected = state.get() == ClientState.CONNECTED && channel != null;
-        if (!connected && !props.isQueueWhenDisconnected()) {
+        if (!connected) {
             return CompletableFuture.failedFuture(new MqttClientException("未连接"));
         }
 
         CompletableFuture<Void> future = new CompletableFuture<>();
         OutboundMessage msg = null;
         // 分配未被占用的 packetId
-        for (int i = 0; i < 0xFFFF; i++) {
-            int id = packetIdGenerator.nextId();
-            OutboundMessage candidate = new OutboundMessage(id, topic, payload, qos, retained, future);
-            if (inflightStore.putIfAbsent(candidate) == null) {
-                msg = candidate;
-                break;
-            }
-        }
+//        for (int i = 0; i < 0xFFFF; i++) {
+//            int id = packetIdGenerator.nextId();
+//            OutboundMessage candidate = new OutboundMessage(id, topic, payload, qos, retained, future);
+//            if (inflightStore.putIfAbsent(candidate) == null) {
+//                msg = candidate;
+//                break;
+//            }
+//        }
         if (msg == null) {
             return CompletableFuture.failedFuture(new MqttClientException("packetId 已耗尽"));
         }
-
-        if (connected) {
-            writePublish(msg);
-        } else {
-            log.debug("连接断开，QoS{} 消息 packetId={} 入队等待重连", qos.value(), msg.packetId());
-        }
+        writePublish(msg);
         scheduleAckTimeout(msg);
         return future;
     }
@@ -538,7 +475,8 @@ public class NettyMqttClient implements MqttClient {
         if (ch == null) {
             return CompletableFuture.failedFuture(new MqttClientException("未连接"));
         }
-        int packetId = packetIdGenerator.nextId();
+        // int packetId = packetIdGenerator.nextId();
+        int packetId = 0;
         CompletableFuture<Integer> future = new CompletableFuture<>();
         pendingSubAcks.put(packetId, future);
         MqttSubscribeMessage msg = new MqttSubscribeMessage(
@@ -575,7 +513,8 @@ public class NettyMqttClient implements MqttClient {
         if (state.get() != ClientState.CONNECTED || ch == null) {
             return CompletableFuture.completedFuture(null);
         }
-        int packetId = packetIdGenerator.nextId();
+        // int packetId = packetIdGenerator.nextId();
+        int packetId = 0;
         CompletableFuture<Void> future = new CompletableFuture<>();
         pendingUnsubAcks.put(packetId, future);
         MqttUnsubscribeMessage msg = new MqttUnsubscribeMessage(
@@ -592,7 +531,7 @@ public class NettyMqttClient implements MqttClient {
     }
 
     public void onUnsubAck(MqttUnsubAckMessage msg) {
-        int packetId = ((MqttMessageIdVariableHeader) msg.variableHeader()).messageId();
+        int packetId = (msg.variableHeader()).messageId();
         CompletableFuture<Void> future = pendingUnsubAcks.remove(packetId);
         if (future != null) {
             future.complete(null);
@@ -646,7 +585,6 @@ public class NettyMqttClient implements MqttClient {
         } else {
             future.complete(null);
         }
-        eventListeners.forEach(l -> safe(l::onClosed));
         return future;
     }
 
@@ -654,7 +592,7 @@ public class NettyMqttClient implements MqttClient {
     public void shutdown() {
         disconnect().join();
         timer.stop();
-        ioGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS);
+        worker.shutdownGracefully(0, 2, TimeUnit.SECONDS);
     }
 
     @Override
@@ -667,21 +605,43 @@ public class NettyMqttClient implements MqttClient {
         return inflightStore.size();
     }
 
-    public String clientId() {
-        return clientId;
-    }
-
     private static void validateTopic(String topic) {
         if (topic == null || topic.isBlank() || topic.contains("+") || topic.contains("#")) {
             throw new IllegalArgumentException("非法发布主题: " + topic);
         }
     }
 
-    private static void safe(Runnable r) {
-        try {
-            r.run();
-        } catch (Exception e) {
-            log.warn("事件监听器执行异常: {}", e.getMessage());
+    private IoHandlerFactory getIoHandlerFactory() {
+        if (isIoUringAvailable()) {
+            log.info("Use IoUringIoHandler factory");
+            return IoUringIoHandler.newFactory();
         }
+        log.info("Use NioIoHandler factory");
+        return NioIoHandler.newFactory();
     }
+
+    private Class<? extends ServerChannel> getServerChannel() {
+        if (isIoUringAvailable()) {
+            log.info("Use IoUringServerSocketChannel");
+            return IoUringServerSocketChannel.class;
+        }
+        log.info("Use NioServerSocketChannel");
+        return NioServerSocketChannel.class;
+    }
+
+    private boolean isIoUringAvailable() {
+        if (isLinux()) {
+            return IoUring.isAvailable();
+        }
+        return false;
+    }
+
+    private boolean isLinux() {
+        return System.getProperty("os.name").contains("Linux");
+    }
+
+    private String generateUUID() {
+        return UUID.randomUUID().toString().replace("-", "");
+    }
+
 }

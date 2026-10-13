@@ -1,10 +1,10 @@
 mqtt:
   client:
     host: 127.0.0.1
-    port: 1883
+    port: 41883
     client-id: ""            # 留空自动生成
-    username:
-    password:
+    username: root
+    password: laokou123
     clean-session: true
     keep-alive-seconds: 60
     connect-timeout-ms: 10000
@@ -28,9 +28,6 @@ mqtt:
     ssl:
       enabled: false
       insecure-skip-verify: false
-    # ---- 演示 ----
-    demo:
-      enabled: false
 
 spring:
   application:
