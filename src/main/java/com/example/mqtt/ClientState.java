@@ -1,4 +1,4 @@
-package com.example.mqtt.client;
+package com.example.mqtt;
 
 /** 客户端连接状态机 */
 public enum ClientState {
